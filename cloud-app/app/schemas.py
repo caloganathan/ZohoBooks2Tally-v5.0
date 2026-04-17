@@ -1,22 +1,36 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+Direction = Literal["ZOHO_TO_TALLY", "TALLY_TO_ZOHO"]
+Priority = Literal["LOW", "NORMAL", "HIGH", "CRITICAL"]
+ObjectType = Literal[
+    "CONTACT",
+    "ITEM",
+    "INVOICE",
+    "BILL",
+    "PAYMENT",
+    "RECEIPT",
+    "JOURNAL",
+    "CREDIT_NOTE",
+    "DEBIT_NOTE",
+]
 
 
 class TenantCreate(BaseModel):
-    name: str
-    zoho_org_id: str | None = None
+    name: str = Field(min_length=1, max_length=255)
+    zoho_org_id: str | None = Field(default=None, max_length=64)
 
 
 class TenantOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     name: str
     zoho_org_id: str | None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class ConnectorEnrollmentOut(BaseModel):
@@ -32,15 +46,17 @@ class HeartbeatIn(BaseModel):
 
 class SyncJobCreate(BaseModel):
     tenant_id: str
-    direction: str
-    object_type: str
-    source_id: str
-    priority: str = "NORMAL"
+    direction: Direction
+    object_type: ObjectType
+    source_id: str = Field(min_length=1, max_length=128)
+    priority: Priority = "NORMAL"
     dependency_keys: list[str] = Field(default_factory=list)
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class SyncJobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     tenant_id: str
     direction: str
@@ -56,14 +72,11 @@ class SyncJobOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
 
 class PullJobsIn(BaseModel):
     connector_id: str
     secret: str
-    limit: int = 10
+    limit: int = Field(default=10, ge=1, le=100)
 
 
 class JobAckIn(BaseModel):
@@ -74,16 +87,15 @@ class JobAckIn(BaseModel):
 class JobFailIn(BaseModel):
     connector_id: str
     secret: str
-    error_message: str
+    error_message: str = Field(min_length=1, max_length=2000)
 
 
 class AuditOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     tenant_id: str | None
     category: str
     action: str
     payload: dict
     created_at: datetime
-
-    class Config:
-        from_attributes = True

@@ -1,3 +1,5 @@
+import secrets as py_secrets
+
 from fastapi import Depends, FastAPI, Header, HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -17,17 +19,26 @@ from .schemas import (
     TenantCreate,
     TenantOut,
 )
-from .services import ack_job, create_job, create_tenant, enroll_connector, fail_job, heartbeat_connector, pull_jobs
+from .services import (
+    ack_job,
+    create_job,
+    create_tenant,
+    enroll_connector,
+    fail_job,
+    heartbeat_connector,
+    pull_jobs,
+    retry_job,
+)
 
 
 Base.metadata.create_all(bind=engine)
 
 
-app = FastAPI(title="ZohoBooks2Tally Cloud App", version="0.2.0")
+app = FastAPI(title="ZohoBooks2Tally Cloud App", version="0.2.1")
 
 
 def verify_api_key(x_api_key: str = Header(default="")) -> None:
-    if x_api_key != settings.cloud_api_key:
+    if not py_secrets.compare_digest(x_api_key or "", settings.cloud_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -42,7 +53,11 @@ def create_tenant_route(data: TenantCreate, db: Session = Depends(get_db)):
     return create_tenant(db, data.name, data.zoho_org_id)
 
 
-@app.post("/tenants/{tenant_id}/connector/enroll", response_model=ConnectorEnrollmentOut, dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/tenants/{tenant_id}/connector/enroll",
+    response_model=ConnectorEnrollmentOut,
+    dependencies=[Depends(verify_api_key)],
+)
 def enroll_connector_route(tenant_id: str, db: Session = Depends(get_db)):
     connector = enroll_connector(db, tenant_id)
     return {
@@ -59,7 +74,7 @@ def heartbeat_route(data: HeartbeatIn, db: Session = Depends(get_db)):
 
 @app.post("/agent/jobs/pull", response_model=list[SyncJobOut], dependencies=[Depends(verify_api_key)])
 def pull_jobs_route(data: PullJobsIn, db: Session = Depends(get_db)):
-    return pull_jobs(db, data.connector_id, data.secret, min(max(data.limit, 1), 100))
+    return pull_jobs(db, data.connector_id, data.secret, data.limit)
 
 
 @app.post("/agent/jobs/{job_id}/ack", dependencies=[Depends(verify_api_key)])
@@ -83,14 +98,8 @@ def list_jobs_route(db: Session = Depends(get_db)):
 
 
 @app.post("/sync/jobs/{job_id}/retry", dependencies=[Depends(verify_api_key)])
-def retry_job(job_id: str, db: Session = Depends(get_db)):
-    job = db.get(SyncJob, job_id)
-    if not job:
-        return {"status": "not_found"}
-    job.status = "QUEUED"
-    job.error_message = None
-    db.commit()
-    return {"status": "queued", "job_id": job_id}
+def retry_job_route(job_id: str, db: Session = Depends(get_db)):
+    return retry_job(db, job_id)
 
 
 @app.post("/reconcile/run", dependencies=[Depends(verify_api_key)])
