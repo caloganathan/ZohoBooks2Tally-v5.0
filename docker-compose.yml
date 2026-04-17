@@ -14,6 +14,7 @@ services:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
 
   cloud-app:
     build: ./cloud-app
@@ -24,6 +25,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
 
   agent:
     build: ./agent
@@ -35,6 +37,7 @@ services:
       - cloud-app
     volumes:
       - agent_data:/data
+    restart: unless-stopped
 
 volumes:
   pg_data:
