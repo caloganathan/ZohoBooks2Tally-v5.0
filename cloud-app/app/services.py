@@ -116,7 +116,7 @@ def create_job(db: Session, data: dict) -> SyncJob:
 
 def pull_jobs(db: Session, connector_id: str, secret: str, limit: int) -> list[SyncJob]:
     connector = authenticate_connector(db, connector_id, secret)
-    jobs = (
+    jobs = list(
         db.execute(
             select(SyncJob)
             .where(SyncJob.tenant_id == connector.tenant_id, SyncJob.status == "QUEUED")

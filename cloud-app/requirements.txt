@@ -4,3 +4,5 @@ sqlalchemy==2.0.40
 psycopg[binary]==3.2.6
 pydantic-settings==2.8.1
 pytest==8.3.5
+httpx==0.28.1
+cryptography==44.0.0
