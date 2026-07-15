@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .crypto import decrypt, encrypt
 from .models import AuditEvent, Connector, SyncJob, Tenant
 
 
@@ -35,10 +36,11 @@ def enroll_connector(db: Session, tenant_id: str) -> Connector:
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    plaintext_secret = secrets.token_urlsafe(32)
     connector = Connector(
         tenant_id=tenant_id,
         enrollment_token=secrets.token_urlsafe(24),
-        secret=secrets.token_urlsafe(32),
+        secret=encrypt(plaintext_secret),  # stored encrypted at rest
     )
     db.add(connector)
     db.flush()
@@ -51,12 +53,15 @@ def enroll_connector(db: Session, tenant_id: str) -> Connector:
     )
     db.commit()
     db.refresh(connector)
+    # Expose the plaintext once, to the enrollment response only; it is never
+    # persisted or returned again.
+    connector.secret_plaintext = plaintext_secret
     return connector
 
 
 def authenticate_connector(db: Session, connector_id: str, secret: str) -> Connector:
     connector = db.get(Connector, connector_id)
-    if not connector or not secrets.compare_digest(connector.secret, secret):
+    if not connector or not secrets.compare_digest(decrypt(connector.secret) or "", secret):
         raise HTTPException(status_code=401, detail="Invalid connector credentials")
     return connector
 

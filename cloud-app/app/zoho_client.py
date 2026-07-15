@@ -1,3 +1,4 @@
+import asyncio
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -7,6 +8,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from .config import settings
+from .crypto import decrypt, encrypt
 from .models import Tenant, ZohoToken
 
 
@@ -33,61 +35,76 @@ class ZohoBooksClient:
         self.org_id: str = org_id
         self._tokens: ZohoTokens | None = None
         self._client = httpx.AsyncClient(timeout=30.0)
-    
+
+        # Org-level throttle: enforce a minimum spacing between API calls.
+        rate = max(1, settings.zoho_rate_limit_per_min)
+        self._min_interval = 60.0 / rate
+        self._last_request_at = 0.0
+        self._rate_lock = asyncio.Lock()
+
+    async def _throttle(self) -> None:
+        """Space out requests to respect Zoho's per-org rate limit."""
+        async with self._rate_lock:
+            loop = asyncio.get_event_loop()
+            wait = self._min_interval - (loop.time() - self._last_request_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_at = loop.time()
+
     async def _get_valid_tokens(self) -> ZohoTokens:
         """Get valid access token, refreshing if needed."""
         if self._tokens and self._tokens.expires_at > time.time() + 60:
             return self._tokens
-        
+
         # Load from DB
         token_record = self.db.query(ZohoToken).filter(
             ZohoToken.tenant_id == self.tenant.id
         ).first()
-        
+
         if token_record:
             self._tokens = ZohoTokens(
-                access_token=token_record.access_token,
-                refresh_token=token_record.refresh_token,
+                access_token=decrypt(token_record.access_token),
+                refresh_token=decrypt(token_record.refresh_token),
                 expires_at=token_record.expires_at,
                 scope=token_record.scope or "",
             )
-            
+
             if self._tokens.expires_at > time.time() + 60:
                 return self._tokens
-            
+
             # Refresh token
             await self._refresh_token(token_record)
             return self._tokens
-        
+
         raise ValueError("No Zoho tokens found for tenant. Run OAuth flow first.")
-    
+
     async def _refresh_token(self, token_record: ZohoToken) -> None:
         """Refresh the access token using refresh token."""
         data = {
-            "refresh_token": token_record.refresh_token,
+            "refresh_token": decrypt(token_record.refresh_token),
             "client_id": settings.zoho_client_id,
             "client_secret": settings.zoho_client_secret,
             "grant_type": "refresh_token",
         }
-        
+
         resp = await self._client.post(self.TOKEN_URL, data=data)
         resp.raise_for_status()
         token_data = resp.json()
-        
+
         expires_at = int(time.time()) + token_data.get("expires_in", 3600)
-        
-        # Update DB
-        token_record.access_token = token_data["access_token"]
+        new_refresh = token_data.get("refresh_token") or decrypt(token_record.refresh_token)
+
+        # Update DB (tokens encrypted at rest)
+        token_record.access_token = encrypt(token_data["access_token"])
         token_record.expires_at = expires_at
-        if "refresh_token" in token_data:
-            token_record.refresh_token = token_data["refresh_token"]
+        token_record.refresh_token = encrypt(new_refresh)
         token_record.scope = token_data.get("scope", "")
         token_record.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         self.db.commit()
-        
+
         self._tokens = ZohoTokens(
             access_token=token_data["access_token"],
-            refresh_token=token_data.get("refresh_token", token_record.refresh_token),
+            refresh_token=new_refresh,
             expires_at=expires_at,
             scope=token_data.get("scope", ""),
         )
@@ -114,11 +131,12 @@ class ZohoBooksClient:
         params["organization_id"] = self.org_id
         
         headers = self._auth_headers(tokens)
-        
+
+        await self._throttle()
         resp = await self._client.request(
             method, url, params=params, json=json_data, headers=headers
         )
-        
+
         if resp.status_code == 401:
             # Force token refresh and retry once
             token_record = self.db.query(ZohoToken).filter(
@@ -134,7 +152,23 @@ class ZohoBooksClient:
         
         resp.raise_for_status()
         return resp.json()
-    
+
+    async def _find_by_external_id(self, endpoint: str, list_key: str, external_id: str) -> dict | None:
+        """
+        Page through a Zoho list endpoint looking for a record whose
+        ``cf_external_id`` matches. Walks every page (Zoho caps per_page at 200),
+        so it is correct for organizations with more than one page of records.
+        """
+        page = 1
+        while True:
+            resp = await self._request("GET", endpoint, params={"page": page, "per_page": 200})
+            for record in resp.get(list_key, []):
+                if record.get("cf_external_id") == external_id:
+                    return record
+            if not resp.get("page_context", {}).get("has_more_page"):
+                return None
+            page += 1
+
     # ============ CONTACTS (Customers/Vendors) ============
     
     async def create_contact(self, contact_data: dict) -> dict:
@@ -162,14 +196,8 @@ class ZohoBooksClient:
         return await self._request("GET", "contacts", params=params)
     
     async def search_contact_by_external_id(self, external_id: str) -> dict | None:
-        """Search contact by custom field (external_id from Tally)."""
-        # Zoho Books doesn't have direct external_id search, use custom field search
-        # This requires a custom field to be set up in Zoho
-        resp = await self.list_contacts(per_page=200)
-        for contact in resp.get("contacts", []):
-            if contact.get("cf_external_id") == external_id:
-                return contact
-        return None
+        """Search contact by external id (Tally ledger GUID) across all pages."""
+        return await self._find_by_external_id("contacts", "contacts", external_id)
     
     # ============ ITEMS ============
     
@@ -190,12 +218,8 @@ class ZohoBooksClient:
         return await self._request("GET", "items", params={"page": page, "per_page": per_page})
     
     async def search_item_by_external_id(self, external_id: str) -> dict | None:
-        """Search item by external ID (Tally stock item ID)."""
-        resp = await self.list_items(per_page=200)
-        for item in resp.get("items", []):
-            if item.get("cf_external_id") == external_id:
-                return item
-        return None
+        """Search item by external ID (Tally stock item GUID) across all pages."""
+        return await self._find_by_external_id("items", "items", external_id)
     
     # ============ INVOICES ============
     
@@ -221,12 +245,8 @@ class ZohoBooksClient:
         return await self._request("GET", "invoices", params=params)
     
     async def search_invoice_by_external_id(self, external_id: str) -> dict | None:
-        """Search invoice by external ID (Tally voucher number)."""
-        resp = await self.list_invoices(per_page=200)
-        for inv in resp.get("invoices", []):
-            if inv.get("cf_external_id") == external_id:
-                return inv
-        return None
+        """Search invoice by external ID (Tally voucher GUID) across all pages."""
+        return await self._find_by_external_id("invoices", "invoices", external_id)
     
     # ============ BILLS (Purchase) ============
     
@@ -252,12 +272,8 @@ class ZohoBooksClient:
         return await self._request("GET", "bills", params=params)
     
     async def search_bill_by_external_id(self, external_id: str) -> dict | None:
-        """Search bill by external ID."""
-        resp = await self.list_bills(per_page=200)
-        for bill in resp.get("bills", []):
-            if bill.get("cf_external_id") == external_id:
-                return bill
-        return None
+        """Search bill by external ID (Tally voucher GUID) across all pages."""
+        return await self._find_by_external_id("bills", "bills", external_id)
     
     # ============ PAYMENTS (Customer Payments / Vendor Payments) ============
     
@@ -288,11 +304,7 @@ class ZohoBooksClient:
         return await self._request("GET", "journals", params={"page": page, "per_page": per_page})
     
     async def search_journal_by_external_id(self, external_id: str) -> dict | None:
-        resp = await self.list_journals(per_page=200)
-        for j in resp.get("journals", []):
-            if j.get("cf_external_id") == external_id:
-                return j
-        return None
+        return await self._find_by_external_id("journals", "journals", external_id)
     
     # ============ CREDIT NOTES / DEBIT NOTES ============
     
@@ -315,11 +327,7 @@ class ZohoBooksClient:
         return await self._request("GET", "chartofaccounts", params={"page": page, "per_page": per_page})
     
     async def search_account_by_external_id(self, external_id: str) -> dict | None:
-        resp = await self.list_accounts(per_page=500)
-        for acc in resp.get("chartofaccounts", []):
-            if acc.get("cf_external_id") == external_id:
-                return acc
-        return None
+        return await self._find_by_external_id("chartofaccounts", "chartofaccounts", external_id)
     
     # ============ TRIAL BALANCE & REPORTS ============
     
@@ -393,241 +401,3 @@ class ZohoBooksClient:
     async def close(self):
         await self._client.aclose()
 
-
-# ============ TALLY TO ZOHO MAPPERS ============
-
-def tally_contact_to_zoho(tally_contact: dict, contact_type: str) -> dict:
-    """Map Tally ledger/contact to Zoho Books contact."""
-    return {
-        "contact_name": tally_contact.get("name", ""),
-        "contact_type": contact_type,  # "customer" or "vendor"
-        "company_name": tally_contact.get("company_name", ""),
-        "gst_treatment": tally_contact.get("gst_treatment", "business_gst"),
-        "gstin": tally_contact.get("gstin", ""),
-        "pan": tally_contact.get("pan", ""),
-        "currency_code": tally_contact.get("currency", "INR"),
-        "payment_terms": tally_contact.get("payment_terms", 0),
-        "payment_terms_label": tally_contact.get("payment_terms_label", ""),
-        "billing_address": {
-            "address": tally_contact.get("billing_address", ""),
-            "city": tally_contact.get("billing_city", ""),
-            "state": tally_contact.get("billing_state", ""),
-            "zip": tally_contact.get("billing_pincode", ""),
-            "country": tally_contact.get("billing_country", "India"),
-        },
-        "shipping_address": {
-            "address": tally_contact.get("shipping_address", ""),
-            "city": tally_contact.get("shipping_city", ""),
-            "state": tally_contact.get("shipping_state", ""),
-            "zip": tally_contact.get("shipping_pincode", ""),
-            "country": tally_contact.get("shipping_country", "India"),
-        },
-        "contact_persons": [
-            {
-                "first_name": tally_contact.get("contact_person", ""),
-                "email": tally_contact.get("email", ""),
-                "phone": tally_contact.get("phone", ""),
-                "mobile": tally_contact.get("mobile", ""),
-                "is_primary_contact": True,
-            }
-        ] if tally_contact.get("contact_person") else [],
-        "cf_external_id": tally_contact.get("tally_ledger_id", ""),
-        "cf_tally_guid": tally_contact.get("tally_guid", ""),
-    }
-
-
-def tally_item_to_zoho(tally_item: dict) -> dict:
-    """Map Tally stock item to Zoho Books item."""
-    return {
-        "name": tally_item.get("name", ""),
-        "description": tally_item.get("description", ""),
-        "rate": float(tally_item.get("rate", 0)),
-        "unit": tally_item.get("unit", "Nos"),
-        "tax_id": tally_item.get("tax_id", ""),
-        "tax_name": tally_item.get("tax_name", "GST"),
-        "tax_percentage": float(tally_item.get("tax_percentage", 18)),
-        "hsn_or_sac": tally_item.get("hsn_code", ""),
-        "item_type": "sales_and_purchases" if tally_item.get("is_inventory") else "sales",
-        "product_type": "goods" if tally_item.get("is_inventory") else "service",
-        "sku": tally_item.get("sku", ""),
-        "cf_external_id": tally_item.get("tally_stock_item_id", ""),
-        "cf_tally_guid": tally_item.get("tally_guid", ""),
-    }
-
-
-def tally_account_to_zoho(tally_account: dict) -> dict:
-    """Map Tally ledger/account to Zoho Books chart of accounts."""
-    return {
-        "account_name": tally_account.get("name", ""),
-        "account_type": tally_account.get("account_type", "other_current_liability"),
-        "description": tally_account.get("description", ""),
-        "currency_code": tally_account.get("currency", "INR"),
-        "opening_balance": float(tally_account.get("opening_balance", 0)),
-        "cf_external_id": tally_account.get("tally_ledger_id", ""),
-        "cf_tally_guid": tally_account.get("tally_guid", ""),
-    }
-
-
-def tally_voucher_to_zoho_invoice(tally_voucher: dict, contact_map: dict, item_map: dict) -> dict:
-    """Map Tally sales voucher to Zoho Books invoice."""
-    lines = []
-    for line in tally_voucher.get("ledger_entries", []):
-        item_id = item_map.get(line.get("stock_item_id", ""))
-        if item_id:
-            lines.append({
-                "item_id": item_id,
-                "name": line.get("item_name", ""),
-                "description": line.get("description", ""),
-                "quantity": float(line.get("quantity", 1)),
-                "rate": float(line.get("rate", 0)),
-                "discount": float(line.get("discount", 0)),
-                "tax_id": line.get("tax_id", ""),
-            })
-    
-    contact_id = contact_map.get(tally_voucher.get("party_ledger_id", ""))
-    
-    return {
-        "customer_id": contact_id,
-        "date": tally_voucher.get("date", ""),
-        "invoice_number": tally_voucher.get("voucher_number", ""),
-        "reference_number": tally_voucher.get("narration", ""),
-        "due_date": tally_voucher.get("due_date", ""),
-        "line_items": lines,
-        "notes": tally_voucher.get("narration", ""),
-        "terms": tally_voucher.get("terms", ""),
-        "cf_external_id": tally_voucher.get("tally_voucher_id", ""),
-        "cf_tally_guid": tally_voucher.get("tally_guid", ""),
-        "cf_tally_voucher_type": tally_voucher.get("voucher_type", "Sales"),
-    }
-
-
-def tally_voucher_to_zoho_bill(tally_voucher: dict, contact_map: dict, item_map: dict) -> dict:
-    """Map Tally purchase voucher to Zoho Books bill."""
-    lines = []
-    for line in tally_voucher.get("ledger_entries", []):
-        item_id = item_map.get(line.get("stock_item_id", ""))
-        if item_id:
-            lines.append({
-                "item_id": item_id,
-                "name": line.get("item_name", ""),
-                "description": line.get("description", ""),
-                "quantity": float(line.get("quantity", 1)),
-                "rate": float(line.get("rate", 0)),
-                "discount": float(line.get("discount", 0)),
-                "tax_id": line.get("tax_id", ""),
-            })
-    
-    contact_id = contact_map.get(tally_voucher.get("party_ledger_id", ""))
-    
-    return {
-        "vendor_id": contact_id,
-        "date": tally_voucher.get("date", ""),
-        "bill_number": tally_voucher.get("voucher_number", ""),
-        "due_date": tally_voucher.get("due_date", ""),
-        "line_items": lines,
-        "notes": tally_voucher.get("narration", ""),
-        "cf_external_id": tally_voucher.get("tally_voucher_id", ""),
-        "cf_tally_guid": tally_voucher.get("tally_guid", ""),
-        "cf_tally_voucher_type": tally_voucher.get("voucher_type", "Purchase"),
-    }
-
-
-def tally_voucher_to_zoho_journal(tally_voucher: dict, account_map: dict) -> dict:
-    """Map Tally journal voucher to Zoho Books journal."""
-    lines = []
-    for entry in tally_voucher.get("ledger_entries", []):
-        account_id = account_map.get(entry.get("ledger_id", ""))
-        if account_id:
-            lines.append({
-                "account_id": account_id,
-                "debit_or_credit": entry.get("type", "debit").lower(),
-                "amount": float(entry.get("amount", 0)),
-                "description": entry.get("narration", ""),
-            })
-    
-    return {
-        "date": tally_voucher.get("date", ""),
-        "reference_number": tally_voucher.get("voucher_number", ""),
-        "notes": tally_voucher.get("narration", ""),
-        "journal_lines": lines,
-        "cf_external_id": tally_voucher.get("tally_voucher_id", ""),
-        "cf_tally_guid": tally_voucher.get("tally_guid", ""),
-        "cf_tally_voucher_type": tally_voucher.get("voucher_type", "Journal"),
-    }
-
-
-def tally_payment_to_zoho(tally_payment: dict, contact_map: dict, account_map: dict) -> dict:
-    """Map Tally payment/receipt to Zoho customer/vendor payment."""
-    contact_id = contact_map.get(tally_payment.get("party_ledger_id", ""))
-    account_id = account_map.get(tally_payment.get("bank_ledger_id", ""))
-    
-    base = {
-        "date": tally_payment.get("date", ""),
-        "amount": float(tally_payment.get("amount", 0)),
-        "reference_number": tally_payment.get("voucher_number", ""),
-        "description": tally_payment.get("narration", ""),
-        "paid_through_account_id": account_id,
-        "cf_external_id": tally_payment.get("tally_voucher_id", ""),
-        "cf_tally_guid": tally_payment.get("tally_guid", ""),
-    }
-    
-    if tally_payment.get("voucher_type") == "Receipt":
-        base["customer_id"] = contact_id
-    else:
-        base["vendor_id"] = contact_id
-    
-    return base
-
-
-def tally_credit_note_to_zoho(tally_cn: dict, contact_map: dict, item_map: dict) -> dict:
-    """Map Tally credit note to Zoho credit note."""
-    lines = []
-    for line in tally_cn.get("ledger_entries", []):
-        item_id = item_map.get(line.get("stock_item_id", ""))
-        if item_id:
-            lines.append({
-                "item_id": item_id,
-                "name": line.get("item_name", ""),
-                "quantity": float(line.get("quantity", 1)),
-                "rate": float(line.get("rate", 0)),
-                "tax_id": line.get("tax_id", ""),
-            })
-    
-    contact_id = contact_map.get(tally_cn.get("party_ledger_id", ""))
-    
-    return {
-        "customer_id": contact_id,
-        "date": tally_cn.get("date", ""),
-        "creditnote_number": tally_cn.get("voucher_number", ""),
-        "line_items": lines,
-        "notes": tally_cn.get("narration", ""),
-        "cf_external_id": tally_cn.get("tally_voucher_id", ""),
-        "cf_tally_guid": tally_cn.get("tally_guid", ""),
-    }
-
-
-def tally_debit_note_to_zoho(tally_dn: dict, contact_map: dict, item_map: dict) -> dict:
-    """Map Tally debit note to Zoho debit note."""
-    lines = []
-    for line in tally_dn.get("ledger_entries", []):
-        item_id = item_map.get(line.get("stock_item_id", ""))
-        if item_id:
-            lines.append({
-                "item_id": item_id,
-                "name": line.get("item_name", ""),
-                "quantity": float(line.get("quantity", 1)),
-                "rate": float(line.get("rate", 0)),
-                "tax_id": line.get("tax_id", ""),
-            })
-    
-    contact_id = contact_map.get(tally_dn.get("party_ledger_id", ""))
-    
-    return {
-        "vendor_id": contact_id,
-        "date": tally_dn.get("date", ""),
-        "debitnote_number": tally_dn.get("voucher_number", ""),
-        "line_items": lines,
-        "notes": tally_dn.get("narration", ""),
-        "cf_external_id": tally_dn.get("tally_voucher_id", ""),
-        "cf_tally_guid": tally_dn.get("tally_guid", ""),
-    }
