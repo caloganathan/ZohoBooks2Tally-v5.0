@@ -24,9 +24,9 @@ from .schemas import (
     TenantOut,
     TrialBalanceReconcileIn,
     TallyZohoMappingOut,
-    ZohoOAuthTokenOut,
     ZohoOAuthURLOut,
 )
+from .crypto import encrypt
 from .services import (
     ack_job,
     create_job,
@@ -90,7 +90,7 @@ def enroll_connector_route(tenant_id: str, db: Session = Depends(get_db)):
     return {
         "connector_id": connector.id,
         "enrollment_token": connector.enrollment_token,
-        "secret": connector.secret,
+        "secret": connector.secret_plaintext,
     }
 
 
@@ -155,46 +155,33 @@ async def process_jobs_batch(
     db: Session = Depends(get_db),
 ):
     """Process all pending TALLY_TO_ZOHO jobs for a tenant."""
-    from .sync_processor import SyncProcessor, ZohoBooksClient
-    
+    from .sync_processor import SyncProcessor, execute_job
+
     tenant = db.get(Tenant, tenant_id)
     if not tenant or not tenant.zoho_org_id:
         raise HTTPException(status_code=404, detail="Tenant not found or missing Zoho org ID")
-    
+
     zoho_client = ZohoBooksClient(db, tenant)
     processor = SyncProcessor(db, tenant_id)
     await processor.initialize(zoho_client)
-    
-    jobs = db.execute(
-        select(SyncJob).where(
-            SyncJob.tenant_id == tenant_id,
-            SyncJob.direction == "TALLY_TO_ZOHO",
-            SyncJob.status == "QUEUED",
-        ).order_by(SyncJob.priority.desc(), SyncJob.created_at.asc()).limit(limit)
-    ).scalars().all()
-    
-    results = []
-    for job in jobs:
-        job.status = "IN_PROGRESS"
-        job.attempt += 1
-        db.commit()
-        
-        try:
-            result = await processor.process_job(job)
-            job.status = "DONE"
-            job.error_message = None
-            results.append({"job_id": job.id, "status": "success", "result": result})
-        except Exception as e:
-            job.error_message = str(e)
-            if job.attempt >= 5:
-                job.status = "DEAD_LETTER"
-            else:
-                job.status = "QUEUED"
-            results.append({"job_id": job.id, "status": "failed", "error": str(e)})
-        
-        db.commit()
-    
-    return {"processed": len(results), "results": results}
+
+    try:
+        # Masters must be applied before the transactions that depend on them,
+        # so ordering is (priority, then object dependency, then age).
+        master_types = ("LEDGER", "CONTACT", "ITEM")
+        jobs = db.execute(
+            select(SyncJob).where(
+                SyncJob.tenant_id == tenant_id,
+                SyncJob.direction == "TALLY_TO_ZOHO",
+                SyncJob.status == "QUEUED",
+            ).order_by(SyncJob.priority.desc(), SyncJob.created_at.asc()).limit(limit)
+        ).scalars().all()
+        jobs.sort(key=lambda j: 0 if j.object_type in master_types else 1)
+
+        results = [await execute_job(db, processor, job) for job in jobs]
+        return {"processed": len(results), "results": results}
+    finally:
+        await zoho_client.close()
 
 
 # ============ ZOHO OAUTH ============
@@ -206,38 +193,47 @@ def get_zoho_oauth_url(state: str | None = None):
     return {"auth_url": auth_url}
 
 
-@app.get("/oauth/zoho/callback", response_model=ZohoOAuthTokenOut)
+@app.get("/oauth/zoho/callback")
 async def zoho_oauth_callback(code: str, state: str | None = None, db: Session = Depends(get_db)):
-    """Handle Zoho OAuth callback and store tokens."""
+    """
+    Handle the Zoho OAuth callback and persist tokens (encrypted at rest).
+
+    Tokens are deliberately NOT returned in the response body -- this endpoint
+    is reached via a browser redirect, and echoing access/refresh tokens would
+    leak them into browser history, referrers and logs.
+    """
     token_data = await ZohoBooksClient.exchange_code_for_tokens(code)
-    
-    # If state contains tenant_id, associate tokens with tenant
+
+    linked = False
     if state and state.startswith("tenant_"):
         tenant_id = state.replace("tenant_", "")
         tenant = db.get(Tenant, tenant_id)
         if tenant:
             expires_at = int(datetime.now(timezone.utc).timestamp()) + token_data.get("expires_in", 3600)
-            
+            enc_access = encrypt(token_data["access_token"])
+            enc_refresh = encrypt(token_data["refresh_token"])
+
             zoho_token = db.query(ZohoToken).filter(ZohoToken.tenant_id == tenant_id).first()
             if zoho_token:
-                zoho_token.access_token = token_data["access_token"]
-                zoho_token.refresh_token = token_data["refresh_token"]
+                zoho_token.access_token = enc_access
+                zoho_token.refresh_token = enc_refresh
                 zoho_token.expires_at = expires_at
                 zoho_token.scope = token_data.get("scope", "")
                 zoho_token.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             else:
                 zoho_token = ZohoToken(
                     tenant_id=tenant_id,
-                    access_token=token_data["access_token"],
-                    refresh_token=token_data["refresh_token"],
+                    access_token=enc_access,
+                    refresh_token=enc_refresh,
                     expires_at=expires_at,
                     scope=token_data.get("scope", ""),
                 )
                 db.add(zoho_token)
-            
+
             db.commit()
-    
-    return token_data
+            linked = True
+
+    return {"status": "connected" if linked else "authorized", "tenant_linked": linked}
 
 
 @app.post("/tenants/{tenant_id}/zoho/connect", dependencies=[Depends(verify_api_key)])
@@ -399,15 +395,24 @@ def delete_mapping(mapping_id: str, db: Session = Depends(get_db)):
 
 @app.post("/reconcile/run", dependencies=[Depends(verify_api_key)])
 def reconcile_run() -> dict:
+    """
+    Describe the reconciliation checks available.
+
+    This does not itself execute a reconciliation (each check needs the
+    corresponding Tally figures supplied by the agent). Use the dedicated,
+    implemented endpoints instead:
+      - POST /reconcile/trial-balance
+      - POST /reconcile/open-invoices
+      - POST /reconcile/payments
+    """
     return {
-        "status": "started",
-        "checks": [
-            "customer_outstanding_balances",
-            "vendor_outstanding_balances",
-            "open_invoice_counts",
-            "receipt_payment_totals",
-            "journal_totals",
-        ],
+        "status": "no_op",
+        "message": "Call a specific /reconcile/* endpoint with Tally figures to run a reconciliation.",
+        "available_checks": {
+            "trial_balance": "/reconcile/trial-balance",
+            "open_invoices": "/reconcile/open-invoices",
+            "payments": "/reconcile/payments",
+        },
     }
 
 

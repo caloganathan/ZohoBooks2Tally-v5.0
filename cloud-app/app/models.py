@@ -33,7 +33,8 @@ class Connector(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
     enrollment_token: Mapped[str] = mapped_column(String(72), nullable=False)
-    secret: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Encrypted at rest (Fernet ciphertext is longer than the plaintext secret).
+    secret: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="ENROLLED")
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
@@ -46,8 +47,9 @@ class ZohoToken(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, unique=True)
-    access_token: Mapped[str] = mapped_column(String(512), nullable=False)
-    refresh_token: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Encrypted at rest via app.crypto (Fernet). Text to fit ciphertext length.
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
     expires_at: Mapped[int] = mapped_column(nullable=False)
     scope: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
