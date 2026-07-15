@@ -6,7 +6,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .database import Base, engine, get_db
+from .database import Base, engine, ensure_column_types, get_db
 from .models import AuditEvent, ReconciliationRun, SyncJob, Tenant, TallyZohoMapping, ZohoToken
 from .schemas import (
     AuditOut,
@@ -42,9 +42,11 @@ from .zoho_client import ZohoBooksClient
 
 
 Base.metadata.create_all(bind=engine)
+# Reconcile column types for existing databases (create_all never ALTERs).
+ensure_column_types()
 
 
-app = FastAPI(title="ZohoBooks2Tally Cloud App", version="0.3.0")
+app = FastAPI(title="Tally2ZohoBooks Cloud App", version="5.7.0")
 
 
 def verify_api_key(x_api_key: str = Header(default="")) -> None:

@@ -1,4 +1,4 @@
-# Developer Test Handoff — ZohoBooks2Tally v5.0
+# Developer Test Handoff — Tally2ZohoBooks v5.7
 
 **What this is:** a one-way sync that pushes **TallyPrime** accounting data into
 **Zoho Books (India edition)**. Your job is to validate it against a Zoho Books
@@ -37,7 +37,7 @@
 
 ```bash
 git clone <repo-url>
-cd ZohoBooks2Tally-v5.0
+cd Tally2ZohoBooks-v5.7
 git checkout claude/tally-zohobooks-sync-review-hr05l7
 ```
 
@@ -130,8 +130,13 @@ Expected correct behaviours to confirm:
 - **GST treatment**: the mapper defaults to `business_gst` when a GSTIN is
   present, else `consumer`. Confirm this matches the client's contact mix; some
   orgs need `overseas` / `sez` / `business_none`.
-- **Fresh database assumed.** The token/secret columns are `Text`; there's no
-  in-place migration from an older schema — test on a clean DB.
+- **Schema upgrade of existing databases.** The token/secret columns are now
+  `Text`. On startup the cloud app runs an idempotent widening
+  (`ensure_column_types()` in `cloud-app/app/database.py`) that ALTERs the
+  `connectors.secret` and `zoho_tokens.access_token/refresh_token` columns to
+  `TEXT` on PostgreSQL, so upgrading an existing deployment does not break
+  connector enrollment. It is a no-op on SQLite. Verify enrollment still works
+  after an upgrade on a copy of an existing DB.
 
 ## 8. How to report findings
 
