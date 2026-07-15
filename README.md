@@ -1,6 +1,6 @@
-# ZohoBooks2Tally v5.0 – Deployable MVP
+# Tally2ZohoBooks v5.7 – Deployable MVP
 
-This repository contains a **deployable MVP** aligned to `zoho-books-tallyprime-sync-architecture.md`.
+This repository contains a **deployable MVP** aligned to `zoho-books-tallyprime-sync-architecture.md`. It performs a one-way sync that pushes **TallyPrime** accounting data into **Zoho Books (India edition)**.
 
 ## What is implemented
 

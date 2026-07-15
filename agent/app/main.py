@@ -12,7 +12,7 @@ from .config import settings
 from .tally_http import TallyClient, parse_tally_xml_response, extract_tally_objects, tally_voucher_to_sync_payload
 
 
-app = FastAPI(title="ZohoBooks2Tally On-Prem Agent", version="0.3.0")
+app = FastAPI(title="Tally2ZohoBooks On-Prem Agent", version="5.7.0")
 
 
 def utcnow_iso() -> str:
