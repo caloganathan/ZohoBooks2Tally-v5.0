@@ -430,3 +430,110 @@ def parse_tally_amount(amount_str: str | None) -> float:
         return float(amount_str.replace(",", ""))
     except (ValueError, AttributeError):
         return 0.0
+
+
+# ==================== VOUCHER -> SYNC PAYLOAD ====================
+
+# Tally voucher type (VCHTYPE) -> cloud sync object_type.
+VCHTYPE_TO_OBJECT_TYPE = {
+    "SALES": "INVOICE",
+    "SALES INVOICE": "INVOICE",
+    "PURCHASE": "BILL",
+    "PURCHASE INVOICE": "BILL",
+    "RECEIPT": "RECEIPT",
+    "PAYMENT": "PAYMENT",
+    "JOURNAL": "JOURNAL",
+    "CREDIT NOTE": "CREDIT_NOTE",
+    "DEBIT NOTE": "DEBIT_NOTE",
+}
+
+
+def _as_list(value: Any) -> list:
+    """Normalize a parsed-XML value that may be a single dict or a list of dicts."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def tally_voucher_to_sync_payload(voucher: dict) -> dict:
+    """
+    Convert a raw parsed Tally voucher (UPPERCASE XML keys) into a normalized
+    cloud sync-job payload.
+
+    Returns a dict shaped for POST /sync/jobs:
+        {"object_type": ..., "source_id": ..., "payload": {...normalized...}}
+
+    The caller is expected to add ``direction`` (e.g. ``TALLY_TO_ZOHO``) and
+    ``tenant_id`` before submitting to the cloud control plane.
+    """
+    vchtype = (voucher.get("VCHTYPE") or voucher.get("VOUCHERTYPENAME") or "").strip()
+    object_type = VCHTYPE_TO_OBJECT_TYPE.get(vchtype.upper(), "JOURNAL")
+
+    guid = voucher.get("GUID", "") or ""
+    voucher_number = voucher.get("VOUCHERNUMBER", "") or ""
+    source_id = guid or voucher_number
+
+    inventory_entries: list[dict[str, Any]] = []
+    for entry in _as_list(voucher.get("ALLINVENTORYENTRIES")):
+        if not isinstance(entry, dict):
+            continue
+        inventory_entries.append({
+            "stock_item_name": entry.get("STOCKITEMNAME", ""),
+            "quantity": parse_tally_amount(entry.get("BILLEDQTY") or entry.get("ACTUALQTY") or "0"),
+            "rate": parse_tally_amount(entry.get("RATE", "0")),
+            "amount": parse_tally_amount(entry.get("AMOUNT", "0")),
+            "unit": entry.get("UNIT", ""),
+            "discount": parse_tally_amount(entry.get("DISCOUNT", "0")),
+            "guid": entry.get("GUID", ""),
+        })
+
+    ledger_entries: list[dict[str, Any]] = []
+    for entry in _as_list(voucher.get("LEDGERENTRIES")):
+        if not isinstance(entry, dict):
+            continue
+        amount = parse_tally_amount(entry.get("AMOUNT", "0"))
+        debit_credit = (entry.get("DEBITCREDIT", "") or "").strip().lower()
+        if debit_credit not in ("debit", "credit"):
+            # Tally encodes debit as a negative amount for most voucher types.
+            debit_credit = "debit" if amount < 0 else "credit"
+        ledger_entries.append({
+            "ledger_name": entry.get("LEDGERNAME", ""),
+            "amount": abs(amount),
+            "type": debit_credit,
+            "narration": entry.get("NARRATION", ""),
+        })
+
+    # Voucher-level amount: prefer the party ledger line if present, else the
+    # largest ledger movement. Falls back to 0 for master-only vouchers.
+    voucher_amount = 0.0
+    party_name = voucher.get("PARTYLEDGERNAME", "")
+    for entry in ledger_entries:
+        if party_name and entry["ledger_name"] == party_name:
+            voucher_amount = entry["amount"]
+            break
+    else:
+        if ledger_entries:
+            voucher_amount = max(e["amount"] for e in ledger_entries)
+
+    return {
+        "object_type": object_type,
+        "source_id": source_id,
+        "payload": {
+            "tally_guid": guid,
+            "voucher_number": voucher_number,
+            "voucher_type": vchtype,
+            "date": parse_tally_date(voucher.get("DATE", "")),
+            "due_date": parse_tally_date(voucher.get("DUEDATE", "")),
+            "party_ledger_name": party_name,
+            "reference": voucher.get("REFERENCE", ""),
+            "narration": voucher.get("NARRATION", ""),
+            "place_of_supply": voucher.get("PLACEOFSUPPLY", ""),
+            "gst_treatment": voucher.get("GSTTREATMENT", ""),
+            "gstin": voucher.get("GSTIN", ""),
+            "amount": voucher_amount,
+            "inventory_entries": inventory_entries,
+            "ledger_entries": ledger_entries,
+        },
+    }

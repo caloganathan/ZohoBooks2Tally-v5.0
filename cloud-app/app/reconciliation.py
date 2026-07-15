@@ -127,21 +127,47 @@ class ReconciliationService:
             raise
     
     def _parse_tally_trial_balance(self, tally_data: dict) -> dict[str, dict]:
-        """Parse Tally trial balance XML/JSON to dict of ledger_name -> {debit, credit}."""
-        ledgers = {}
-        
-        # Tally XML structure: <TRIALBALANCE><LEDGER><NAME>...</NAME><DEBIT>...</DEBIT><CREDIT>...</CREDIT></LEDGER></TRIALBALANCE>
-        for ledger in tally_data.get("TRIALBALANCE", {}).get("LEDGER", []):
-            name = ledger.get("NAME", "").strip()
-            debit = self._safe_decimal(ledger.get("DEBIT", "0"))
-            credit = self._safe_decimal(ledger.get("CREDIT", "0"))
-            
-            if name:
-                ledgers[name] = {
-                    "debit": float(debit.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
-                    "credit": float(credit.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
-                }
-        
+        """
+        Parse a Tally trial balance into ``{ledger_name: {debit, credit}}``.
+
+        Accepts two shapes:
+          1. The already-normalized mapping produced by the API layer:
+             ``{"Cash": {"debit": 1000, "credit": 0}, ...}``.
+          2. The raw XML-derived structure:
+             ``{"TRIALBALANCE": {"LEDGER": [{"NAME":..,"DEBIT":..,"CREDIT":..}]}}``.
+        """
+        ledgers: dict[str, dict] = {}
+
+        def _norm(debit_raw, credit_raw) -> dict:
+            debit = self._safe_decimal(debit_raw)
+            credit = self._safe_decimal(credit_raw)
+            return {
+                "debit": float(debit.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                "credit": float(credit.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            }
+
+        # Shape 2: raw Tally XML structure.
+        trial_balance = tally_data.get("TRIALBALANCE")
+        if isinstance(trial_balance, dict):
+            raw_ledgers = trial_balance.get("LEDGER", [])
+            if not isinstance(raw_ledgers, list):
+                raw_ledgers = [raw_ledgers]
+            for ledger in raw_ledgers:
+                if not isinstance(ledger, dict):
+                    continue
+                name = (ledger.get("NAME", "") or "").strip()
+                if name:
+                    ledgers[name] = _norm(ledger.get("DEBIT", "0"), ledger.get("CREDIT", "0"))
+            return ledgers
+
+        # Shape 1: pre-normalized {ledger_name: {debit, credit}} mapping.
+        for name, values in tally_data.items():
+            if not isinstance(values, dict):
+                continue
+            clean_name = (name or "").strip()
+            if clean_name:
+                ledgers[clean_name] = _norm(values.get("debit", 0), values.get("credit", 0))
+
         return ledgers
     
     def _parse_zoho_trial_balance(self, zoho_data: dict) -> dict[str, dict]:

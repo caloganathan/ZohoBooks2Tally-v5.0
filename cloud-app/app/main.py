@@ -283,25 +283,19 @@ async def reconcile_trial_balance(data: TrialBalanceReconcileIn, db: Session = D
 @app.post("/reconcile/open-invoices", response_model=ReconciliationRunOut, dependencies=[Depends(verify_api_key)])
 async def reconcile_open_invoices(data: OpenInvoicesReconcileIn, db: Session = Depends(get_db)):
     """Reconcile open invoices between Tally and Zoho Books."""
-    # Implementation similar to trial balance but for invoices
     tenant = db.get(Tenant, data.tenant_id)
     if not tenant or not tenant.zoho_org_id:
         raise HTTPException(status_code=404, detail="Tenant not found or missing Zoho org ID")
-    
-    run = ReconciliationRun(
+
+    zoho_client = ZohoBooksClient(db, tenant)
+    service = ReconciliationService(db)
+    return await service.run_open_invoices_reconciliation(
         tenant_id=data.tenant_id,
-        run_type="OPEN_INVOICES",
         period_from=data.period_from,
         period_to=data.period_to,
-        status="COMPLETED",
-        completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        zoho_client=zoho_client,
+        tally_open_invoices=data.tally_open_invoices,
     )
-    db.add(run)
-    db.commit()
-    db.refresh(run)
-    
-    # TODO: Implement invoice comparison logic
-    return run
 
 
 @app.post("/reconcile/payments", response_model=ReconciliationRunOut, dependencies=[Depends(verify_api_key)])
@@ -310,21 +304,16 @@ async def reconcile_payments(data: PaymentsReconcileIn, db: Session = Depends(ge
     tenant = db.get(Tenant, data.tenant_id)
     if not tenant or not tenant.zoho_org_id:
         raise HTTPException(status_code=404, detail="Tenant not found or missing Zoho org ID")
-    
-    run = ReconciliationRun(
+
+    zoho_client = ZohoBooksClient(db, tenant)
+    service = ReconciliationService(db)
+    return await service.run_payments_reconciliation(
         tenant_id=data.tenant_id,
-        run_type="PAYMENTS",
         period_from=data.period_from,
         period_to=data.period_to,
-        status="COMPLETED",
-        completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        zoho_client=zoho_client,
+        tally_payments=data.tally_payments,
     )
-    db.add(run)
-    db.commit()
-    db.refresh(run)
-    
-    # TODO: Implement payment comparison logic
-    return run
 
 
 @app.get("/reconcile/runs", response_model=list[ReconciliationRunOut], dependencies=[Depends(verify_api_key)])
